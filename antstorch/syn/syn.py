@@ -123,14 +123,23 @@ def _gaussian_blur_image(image: Tensor, sigma: float) -> Tensor:
     coordinate = torch.arange(-radius, radius + 1, dtype=dtype, device=device)
     kernel_1d = torch.exp(-0.5 * (coordinate / sigma).square())
     kernel_1d = kernel_1d / kernel_1d.sum()
-    kernel = kernel_1d
-    for _ in range(dim - 1):
-        kernel = kernel.unsqueeze(-1) * kernel_1d.reshape((1,) * kernel.ndim + (-1,))
-    kernel = kernel.reshape((1, 1) + kernel.shape).expand((image.shape[1], 1) + kernel.shape)
-    padding = tuple(value for _ in range(dim) for value in (radius, radius))
-    padded = F.pad(image, padding, mode="replicate")
+    # Separable: one 1-D pass per axis, each with its own replicate padding. The dense kernel
+    # this replaces is the outer product of the same 1-D kernels, and replicate padding is
+    # separable too, so the result is the same up to floating-point rounding -- at
+    # (2r+1) * dim instead of (2r+1)**dim multiply-adds per voxel (37**3 vs 3*37 at sigma=6).
     convolution = F.conv2d if dim == 2 else F.conv3d
-    return convolution(padded, kernel, groups=image.shape[1])
+    channels = image.shape[1]
+    out = image
+    for axis in range(dim):
+        shape = [1] * dim
+        shape[axis] = kernel_1d.numel()
+        kernel = kernel_1d.reshape([1, 1] + shape).expand([channels, 1] + shape)
+        # F.pad lists padding from the last spatial axis backwards
+        padding = [0, 0] * dim
+        padding[2 * (dim - 1 - axis)] = radius
+        padding[2 * (dim - 1 - axis) + 1] = radius
+        out = convolution(F.pad(out, tuple(padding), mode="replicate"), kernel, groups=channels)
+    return out
 
 
 def _shrunk_torch_shape(torch_shape: Tuple[int, ...], factor: int, syntx_parity: bool = False) -> Tuple[int, ...]:
@@ -393,6 +402,41 @@ def _eulerian_update(warp: Tensor, delta: Tensor, X_phys: Tensor, meta_t: Dict[s
     return sampled.movedim(1, -1) - delta
 
 
+def _write_image(image, path: str) -> None:
+    """ants.image_write, but .nii.gz is written uncompressed and compressed with pigz when available.
+
+    ITK's NIfTI writer gzips on one core (about 15 min for a 22 GB displacement field); pigz uses all
+    the cores the job has. The decompressed bytes are identical; only the gzip stream differs.
+    """
+    import os
+    import shutil
+    import subprocess
+    pigz = shutil.which("pigz")
+    if not (path.endswith(".nii.gz") and pigz):
+        ants.image_write(image, path)
+        return
+    raw = path[:-3]
+    ants.image_write(image, raw)
+    threads = os.environ.get("SLURM_CPUS_PER_TASK") or str(os.cpu_count() or 1)
+    subprocess.run([pigz, "-f", "-p", threads, raw], check=True)   # writes raw + ".gz" == path, removes raw
+
+
+def _eulerian_update_rows(warp: Tensor, delta: Tensor, X_phys, meta_t: Dict[str, Tensor], chunk_rows: int = 64) -> Tensor:
+    """_eulerian_update computed in row chunks of the output (same operations per voxel)."""
+    out = torch.empty_like(warp)
+    warp_cf = warp.movedim(-1, 1)
+    rows = warp.shape[1]
+    for a in range(0, rows, chunk_rows):
+        b = min(rows, a + chunk_rows)
+        coords_norm = physical_to_normalized_torch_cached(
+            X_phys[:, a:b] - delta[:, a:b], meta_t["shape_t"], meta_t["spacing_t"], meta_t["origin_t"], meta_t["direction_t"]
+        )
+        sampled = grid_sample(warp_cf, coords_norm, mode="bilinear", padding_mode="border", align_corners=True)
+        out[:, a:b] = sampled.movedim(1, -1) - delta[:, a:b]
+        del coords_norm, sampled
+    return out
+
+
 def _compose_fixed_grid(first: Tensor, second: Tensor, X_phys: Tensor, meta_t: Dict[str, Tensor]) -> Tensor:
     """``T_second o T_first``: ``first(x) + second(x + first(x))``, both fields on the same (fixed) grid."""
     coords_phys = X_phys + first
@@ -448,13 +492,38 @@ def _fit_syn_level(
     optimizer_lr: float = 1.0,
     metric_terms=None,
     metric_masks=None,
+    warp_state: Optional[list] = None,
+    metric_chunks: int = 1,
+    metric_devices=None,
+    inverse_history_device=None,
+    convergence_threshold: Optional[float] = None,
+    convergence_window: int = 10,
+    step_scaling: str = "sqrt_shrink",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, list]:
+    if warp_state is not None:
+        # Take ownership of the incoming warps so the caller holds no reference to them
+        # (four full-resolution vector fields that would otherwise stay alive all level).
+        warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = warp_state
+        warp_state.clear()
     device, dtype = I_curr.device, I_curr.dtype
     fixed_meta_t = metadata_tensors_from_dict(fixed_meta, device, dtype)
     moving_meta_t = metadata_tensors_from_dict(moving_meta, device, dtype)
-    X_phys = _physical_grid(fixed_meta, device, dtype)
+    # In the slab-chunked metric + ITK-inverse configuration every consumer of the physical grid works on
+    # row ranges, so the grid is built per range instead of stored (one full vector field less).
+    lazy_grid = ((metric_chunks > 1 or bool(metric_devices)) and metric_terms is None and not syntx_parity
+                 and inverse_schedule == "itk" and regularizer != "bspline"
+                 and similarity in ("cc", "lncc", "cc2", "lncc2"))
+    if lazy_grid:
+        from .core.distributed import PhysicalRows
+        X_phys = PhysicalRows(fixed_meta, device, dtype)
+    else:
+        X_phys = _physical_grid(fixed_meta, device, dtype)
     boundary_mask = get_boundary_mask(fixed_meta["torch_shape"], device, dtype)
-    if syntx_parity:
+    if step_scaling == "ants":
+        # ITK SyNImageRegistrationMethod::ScaleUpdateField: the largest update is the learning rate in
+        # voxels of the current level's grid, at every level.
+        level_cfl_voxels = grad_step
+    elif syntx_parity:
         # syntx scales the CFL step by sqrt(curr_size/original_size) <= 1
         # (coarse levels take SMALLER steps); the default here is the inverse.
         level_cfl_voxels = grad_step * math.sqrt(1.0 / float(shrink_factor))
@@ -508,6 +577,7 @@ def _fit_syn_level(
                 moving_meta_t["shape_t"], moving_meta_t["spacing_t"], moving_meta_t["origin_t"], moving_meta_t["direction_t"],
                 fixed_meta["spacing"], moving_meta["spacing"], M_phys, t_phys, None,
                 use_analytical_gradients=use_analytical_gradients,
+                compute_gradients=False,  # the sampled image gradients are discarded below
             )
             return _similarity_loss(similarity, a, b, valid, window_size, num_bins)
         fixed_grid = physical_to_normalized_torch_cached(
@@ -535,22 +605,51 @@ def _fit_syn_level(
             loss = loss + weight * _similarity_loss(name, a_mid, b_mid, valid, 2 * radius + 1, bins)
         return loss
 
+    # Optional slab-chunked (and optionally multi-device) evaluation of the plain local-CC
+    # objective: same per-voxel metric, bounded autograd memory (see core/chunked_metric.py).
+    chunked = None
+    if ((metric_chunks > 1 or metric_devices) and metric_terms is None and not syntx_parity
+            and similarity in ("cc", "lncc", "cc2", "lncc2")):
+        from .core.chunked_metric import ChunkedLocalCC
+        chunked = ChunkedLocalCC(
+            I_curr, J_curr, X_phys, fixed_meta_t, moving_meta_t, fixed_meta["spacing"], moving_meta["spacing"],
+            M_phys, t_phys, window_size, squared=similarity in ("cc2", "lncc2"),
+            n_chunks=max(1, metric_chunks), devices=metric_devices,
+            use_analytical_gradients=use_analytical_gradients,
+        )
+
+    # antsRegistration-style early stop (-c [iterations,threshold,window]); see core/convergence.py
+    monitor = None
+    if convergence_threshold is not None:
+        from .core.convergence import WindowConvergenceMonitor
+        monitor = WindowConvergenceMonitor(convergence_window)
+
     history = []
     for iteration in range(iterations):
-        warp_l2r_leaf = warp_l2r.detach().requires_grad_(True)
-        warp_r2l_leaf = warp_r2l.detach().requires_grad_(True)
+        if chunked is not None:
+            warp_l2r_leaf, warp_r2l_leaf = warp_l2r.detach(), warp_r2l.detach()
+            loss_value, grad_l, grad_r = chunked(warp_l2r_leaf, warp_r2l_leaf)
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(f"non-finite SyN loss at resolution level {level_index + 1}")
+        else:
+            warp_l2r_leaf = warp_l2r.detach().requires_grad_(True)
+            warp_r2l_leaf = warp_r2l.detach().requires_grad_(True)
 
-        loss = objective(warp_l2r_leaf, warp_r2l_leaf, warp_l2r_inv, warp_r2l_inv)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite SyN loss at resolution level {level_index + 1}")
-        if syntx_parity and float(loss.detach().item()) < best_loss:
-            # syntx keeps the (pre-update) warps of the best loss seen.
-            best_loss = float(loss.detach().item())
-            best_state = (warp_l2r.detach().clone(), warp_r2l.detach().clone(),
-                          warp_l2r_inv.detach().clone(), warp_r2l_inv.detach().clone())
-        loss.backward()
-        grad_l = warp_l2r_leaf.grad
-        grad_r = warp_r2l_leaf.grad
+            loss = objective(warp_l2r_leaf, warp_r2l_leaf, warp_l2r_inv, warp_r2l_inv)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"non-finite SyN loss at resolution level {level_index + 1}")
+            if syntx_parity and float(loss.detach().item()) < best_loss:
+                # syntx keeps the (pre-update) warps of the best loss seen.
+                best_loss = float(loss.detach().item())
+                best_state = (warp_l2r.detach().clone(), warp_r2l.detach().clone(),
+                              warp_l2r_inv.detach().clone(), warp_r2l_inv.detach().clone())
+            loss.backward()
+            # The backward graph's AccumulateGrad nodes (reachable from loss.grad_fn) keep the
+            # leaves -- and so the previous warps -- alive; keep only the value.
+            loss_value = float(loss.detach().item())
+            del loss
+            grad_l = warp_l2r_leaf.grad
+            grad_r = warp_r2l_leaf.grad
         if grad_l is None or grad_r is None or not torch.isfinite(grad_l).all() or not torch.isfinite(grad_r).all():
             raise FloatingPointError(f"non-finite SyN half-warp gradient at resolution level {level_index + 1}")
 
@@ -659,13 +758,25 @@ def _fit_syn_level(
 
             delta_l = _cfl_normalize(grad_l, fixed_meta_t["spacing_t"], level_cfl_voxels)
             delta_r = _cfl_normalize(grad_r, fixed_meta_t["spacing_t"], level_cfl_voxels)
+        # The raw/regularized gradients are no longer needed once the steps exist.
+        del grad_l, grad_r
+        warp_l2r_leaf.grad = None
+        warp_r2l_leaf.grad = None
         if antisymmetric:
             common_mode = delta_l + delta_r
             delta_l = delta_l - 0.5 * common_mode
             delta_r = delta_r - 0.5 * common_mode
+            del common_mode
 
-        warp_l2r = _eulerian_update(warp_l2r_leaf.detach(), delta_l, X_phys, fixed_meta_t)
-        warp_r2l = _eulerian_update(warp_r2l_leaf.detach(), delta_r, X_phys, fixed_meta_t)
+        # Drop the loop's own references to the previous warps so each is freed as soon as
+        # its update exists (the leaves alias them).
+        previous_l2r, previous_r2l = warp_l2r_leaf.detach(), warp_r2l_leaf.detach()
+        del warp_l2r_leaf, warp_r2l_leaf, warp_l2r, warp_r2l
+        update_fn = _eulerian_update_rows if lazy_grid else _eulerian_update
+        warp_l2r = update_fn(previous_l2r, delta_l, X_phys, fixed_meta_t)
+        del previous_l2r, delta_l
+        warp_r2l = update_fn(previous_r2l, delta_r, X_phys, fixed_meta_t)
+        del previous_r2l, delta_r
 
         if regularizer == "bspline":
             if _mesh_size_active(total_mesh_size_level):
@@ -688,6 +799,23 @@ def _fit_syn_level(
         # in_loop_inverse_steps solver steps after every iteration;
         # 'end_of_level' skips it here and inverts once after the last level's
         # iterations (see below).
+        if inverse_schedule == "itk":
+            # ITK SyNImageRegistrationMethod, every iteration and for both half-warps:
+            #   T_inv = Invert(T, warm start T_inv);  T = Invert(T_inv, warm start T)
+            # (InvertDisplacementFieldImageFilter: 20 iterations, mean 0.001 / max 0.1 tolerance, stop when
+            # either is met, boundary held at zero). The round trip keeps each half-warp invertible.
+            itk_inv = dict(steps=20, method="fixed_point", convergence_criterion="either",
+                           max_error_threshold=0.1, mean_error_threshold=0.001,
+                           spacing=fixed_meta["spacing"], origin=fixed_meta["origin"],
+                           direction=fixed_meta["direction"], X_phys=X_phys, chunk_rows=64)
+            if warp_l2r_inv is None:
+                warp_l2r_inv = torch.zeros_like(warp_l2r)
+            if warp_r2l_inv is None:
+                warp_r2l_inv = torch.zeros_like(warp_r2l)
+            warp_l2r_inv = update_inverse_field_nd(warp_l2r, warp_l2r_inv, **itk_inv)
+            warp_l2r = update_inverse_field_nd(warp_l2r_inv, warp_l2r, **itk_inv)
+            warp_r2l_inv = update_inverse_field_nd(warp_r2l, warp_r2l_inv, **itk_inv)
+            warp_r2l = update_inverse_field_nd(warp_r2l_inv, warp_r2l, **itk_inv)
         if inverse_schedule == "per_iteration":
             warp_l2r_inv = update_inverse_field_nd(
                 warp_l2r, warp_l2r_inv, steps=in_loop_inverse_steps, method=inverse_method,
@@ -698,8 +826,12 @@ def _fit_syn_level(
                 spacing=fixed_meta["spacing"], origin=fixed_meta["origin"], direction=fixed_meta["direction"], X_phys=X_phys,
             )
 
-        current = float(loss.detach().item())
+        current = loss_value
         history.append(current)
+        if monitor is not None and monitor.add(current) < convergence_threshold:
+            if verbose:
+                print(f"  [SyN level {level_index + 1}/{num_levels}] converged after {iteration + 1} iterations")
+            break
         if verbose:
             print(
                 f"  [SyN level {level_index + 1}/{num_levels}] iteration {iteration + 1:04d}/{iterations}: "
@@ -727,13 +859,18 @@ def _fit_syn_level(
         warp_l2r_inv = update_inverse_field_nd(
             warp_l2r, -warp_l2r, steps=end_of_level_inverse_steps, method=inverse_method,
             spacing=fixed_meta["spacing"], origin=fixed_meta["origin"], direction=fixed_meta["direction"], X_phys=X_phys,
+            history_device=inverse_history_device,
         )
         warp_r2l_inv = update_inverse_field_nd(
             warp_r2l, -warp_r2l, steps=end_of_level_inverse_steps, method=inverse_method,
             spacing=fixed_meta["spacing"], origin=fixed_meta["origin"], direction=fixed_meta["direction"], X_phys=X_phys,
+            history_device=inverse_history_device,
         )
 
-    return warp_l2r.detach(), warp_r2l.detach(), warp_l2r_inv.detach(), warp_r2l_inv.detach(), history
+    def _detached(t):
+        return None if t is None else t.detach()
+
+    return _detached(warp_l2r), _detached(warp_r2l), _detached(warp_l2r_inv), _detached(warp_r2l_inv), history
 
 
 def _fit_affine_from_ants(
@@ -910,6 +1047,16 @@ def syn_registration(
     primary_metric_weight: float = 1.0,
     mask=None,
     moving_mask=None,
+    metric_chunks: int = 1,
+    metric_devices=None,
+    inverse_history_device=None,
+    normalize_intensities: bool = True,
+    convergence_threshold: Optional[float] = None,
+    convergence_window: int = 10,
+    final_level_devices: Optional[Sequence] = None,
+    distribute_max_shrink: int = 1,
+    step_scaling: str = "sqrt_shrink",
+    ants_parity: bool = False,
 ) -> Dict[str, object]:
     """Register ``moving`` onto ``fixed`` with (optionally affine-initialized) greedy symmetric SyN.
 
@@ -1198,8 +1345,17 @@ def syn_registration(
             "optimizer='syn_reg_adam' reproduces syntx.syn()'s reg_adam for the spectral regularizers only "
             "('sobolev', 'dsti'); syntx smooths the Adam quotient differently for 'gaussian'/'bspline'"
         )
-    if inverse_schedule not in ("per_iteration", "end_of_level"):
-        raise ValueError("inverse_schedule must be 'per_iteration' or 'end_of_level'")
+    if ants_parity:
+        # Reproduce antsRegistration's SyN update (ITK SyNImageRegistrationMethod) rather than the
+        # syntx-aligned greedy variant: learning rate in voxels of each level's grid, no midpoint-gradient
+        # averaging (ITK m_AverageMidPointGradients = false), and the per-iteration double inversion of
+        # both half-warps with ITK's fixed-point inverter. Use with convergence_threshold for ANTs' -c rule.
+        step_scaling = "ants"
+        inverse_schedule = "itk"
+        antisymmetric = False
+        inverse_method = "fixed_point"
+    if inverse_schedule not in ("per_iteration", "end_of_level", "itk"):
+        raise ValueError("inverse_schedule must be 'per_iteration', 'end_of_level' or 'itk'")
     if end_of_level_inverse_steps < 1:
         raise ValueError("end_of_level_inverse_steps must be >= 1")
     if update_field_mesh_size_at_base_level is not None and update_field_mesh_size_at_base_level < 0:
@@ -1421,8 +1577,11 @@ def syn_registration(
 
     fixed_meta_full = ants_image_metadata(fixed)
     moving_meta_full = ants_image_metadata(moving)
-    I_full = ants_image_to_tensor(fixed, resolved_device, dtype)
-    J_full = ants_image_to_tensor(moving, resolved_device, dtype)
+    # normalize_intensities=False uses the images as given (e.g. already winsorized and
+    # histogram-matched the way antsRegistration -w/-u does), instead of the foreground
+    # 2nd-98th percentile clip.
+    I_full = ants_image_to_tensor(fixed, resolved_device, dtype, normalize=normalize_intensities)
+    J_full = ants_image_to_tensor(moving, resolved_device, dtype, normalize=normalize_intensities)
 
     # Extra images share the respective primary image domains. MSE masks
     # retain their binary amplitudes; intensity metrics use the usual normalization.
@@ -1525,17 +1684,112 @@ def syn_registration(
         sigma = None if smoothing_sigmas is None else smoothing_sigmas[level_index]
         I_level, fixed_meta_level = _downsample_image(I_full, fixed_meta_full, factor, syntx_parity, sigma)
         J_level, moving_meta_level = _downsample_image(J_full, moving_meta_full, factor, syntx_parity, sigma)
+        distribute_level = bool(final_level_devices) and (level_index == num_levels - 1 or factor <= distribute_max_shrink)
+        if distribute_level:
+            # This level split across several devices (core/distributed.py). The finest level produces
+            # only the two warp files (no warped images / Jacobian), which is what a template-building
+            # loop consumes; apply the transforms with antsApplyTransforms as usual. Coarser split levels
+            # hand their fields back to the host for upsampling to the next level.
+            from .core.distributed import _Layout, fit_final_level_distributed
+            is_final = level_index == num_levels - 1
+            unsupported = [name for name, bad in (
+                ("regularizer must be 'gaussian'", regularizer != "gaussian"),
+                ("optimizer must be 'gradient_descent'", optimizer != "gradient_descent"),
+                ("total_sigma must be 0", total_sigma > 0),
+                ("inverse_schedule must be 'end_of_level' or 'itk'", inverse_schedule not in ("end_of_level", "itk")),
+                ("inverse_method must be 'fixed_point'", inverse_method != "fixed_point"),
+                ("gaussian_sigma_mode must be 'voxel'", gaussian_sigma_mode != "voxel"),
+                ("no multivariate metrics or masks", metric_terms_full is not None),
+                ("syntx_parity must be False", syntx_parity),
+            ) if bad]
+            if unsupported:
+                raise ValueError("final_level_devices: " + "; ".join(unsupported))
+            torch_shape = tuple(fixed_meta_level["torch_shape"])
+            layout = _Layout(torch_shape[0], final_level_devices)
+
+            def to_slabs(field):
+                # previous level's field -> this level's grid on the host (same trilinear upsampling),
+                # then one core slab per device
+                if field is None:
+                    return None
+                full = _upsample_field(field.detach().cpu(), torch_shape)
+                out = [full[:, z0:z1].to(d) for (z0, z1), d in zip(layout.cores, layout.devices)]
+                del full
+                return out
+            if warp_l2r is None:
+                zero = torch.zeros((1,) + torch_shape + (dimension,), dtype=dtype)
+                warp_l2r, warp_r2l = zero, zero
+            parts_l2r, parts_r2l = to_slabs(warp_l2r), to_slabs(warp_r2l)
+            inv_parts_l2r = to_slabs(warp_l2r_inv) if inverse_schedule == "itk" else None
+            inv_parts_r2l = to_slabs(warp_r2l_inv) if inverse_schedule == "itk" else None
+            warp_l2r = warp_r2l = warp_l2r_inv = warp_r2l_inv = None
+            I_by_dev = {str(d): I_level.to(d) for d in layout.devices}
+            J_by_dev = {str(d): J_level.to(d) for d in layout.devices}
+            I_level = J_level = None
+            if is_final:
+                I_full = J_full = None           # the finest level holds its own copies
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if verbose:
+                print(f"SyN resolution level {level_index + 1}/{num_levels} on {len(layout.devices)} devices: "
+                      f"shrink_factor={factor}, fixed_size={torch_shape}, slabs={layout.cores}, iterations={iteration_count}")
+            out = fit_final_level_distributed(
+                I_by_dev, J_by_dev, fixed_meta_level, moving_meta_level, parts_l2r, parts_r2l, layout,
+                M_phys, t_phys, iterations=iteration_count, similarity=syn_metric, window_size=window_size,
+                flow_sigma=flow_sigma, grad_step=grad_step, shrink_factor=factor, antisymmetric=antisymmetric,
+                end_of_level_inverse_steps=end_of_level_inverse_steps,
+                use_analytical_gradients=use_analytical_gradients,
+                convergence_threshold=convergence_threshold, convergence_window=convergence_window,
+                verbose=verbose, inverse_schedule=inverse_schedule, step_scaling=step_scaling,
+                inv_l2r_parts=inv_parts_l2r, inv_r2l_parts=inv_parts_r2l, final=is_final)
+            del parts_l2r, parts_r2l, inv_parts_l2r, inv_parts_r2l, I_by_dev, J_by_dev
+            if not is_final:
+                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, history = out
+                del out
+                level_loss_history.append(history)
+                continue
+            syn_forward, syn_inverse, history = out
+            del out
+            level_loss_history.append(history)
+            warp_path = f"{resolved_outprefix}1Warp.nii.gz"
+            inverse_warp_path = f"{resolved_outprefix}1InverseWarp.nii.gz"
+            _write_image(displacement_zyx_to_ants_image(syn_forward, fixed), warp_path)
+            del syn_forward
+            _write_image(displacement_zyx_to_ants_image(syn_inverse, fixed), inverse_warp_path)
+            del syn_inverse
+            affine_path = None
+            if initial_affine is not None or affine_result is not None:
+                affine_path = f"{resolved_outprefix}0GenericAffine.mat"
+                write_affine_transform(matrix_xyz.detach().cpu(), translation_xyz.detach().cpu(), dimension, affine_path)
+            fwdtransforms, invtransforms = build_transform_lists(
+                affine_path=affine_path, warp_path=warp_path, inverse_warp_path=inverse_warp_path)
+            return {
+                "warpedmovout": None, "warpedfixout": None, "jacobian": None,
+                "fwdtransforms": fwdtransforms, "invtransforms": invtransforms,
+                "loss_history": [v for lev in level_loss_history for v in lev],
+                "level_loss_history": level_loss_history,
+                "affine_matrix": matrix_xyz.detach().cpu(), "affine_translation": translation_xyz.detach().cpu(),
+                "final_level_devices": [str(d) for d in layout.devices], "final_level_slabs": layout.cores,
+            }
+        # With the end-of-level schedule nothing reads the inverse half-warps during the
+        # iterations (the last level re-solves them from -W), so they are not carried
+        # between levels: two fewer full-resolution vector fields.
+        skip_inverses = inverse_schedule == "end_of_level" and not syntx_parity
         if warp_l2r is None:
             zeros = torch.zeros(
                 (1,) + fixed_meta_level["torch_shape"] + (dimension,), device=resolved_device, dtype=dtype
             )
             warp_l2r, warp_r2l = zeros.clone(), zeros.clone()
-            warp_l2r_inv, warp_r2l_inv = zeros.clone(), zeros.clone()
+            warp_l2r_inv, warp_r2l_inv = (None, None) if skip_inverses else (zeros.clone(), zeros.clone())
+            del zeros
         else:
             warp_l2r = _upsample_field(warp_l2r, fixed_meta_level["torch_shape"])
             warp_r2l = _upsample_field(warp_r2l, fixed_meta_level["torch_shape"])
-            warp_l2r_inv = _upsample_field(warp_l2r_inv, fixed_meta_level["torch_shape"])
-            warp_r2l_inv = _upsample_field(warp_r2l_inv, fixed_meta_level["torch_shape"])
+            if skip_inverses:
+                warp_l2r_inv = warp_r2l_inv = None
+            else:
+                warp_l2r_inv = _upsample_field(warp_l2r_inv, fixed_meta_level["torch_shape"])
+                warp_r2l_inv = _upsample_field(warp_r2l_inv, fixed_meta_level["torch_shape"])
 
         if verbose:
             message = (
@@ -1577,9 +1831,18 @@ def syn_registration(
                 value, size=meta["torch_shape"], mode="nearest")
                 for value, meta in zip(metric_masks_full, (fixed_meta_level, moving_meta_level))]
 
+        warp_state = [warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv]
+        warp_l2r = warp_r2l = warp_l2r_inv = warp_r2l_inv = None
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, history = _fit_syn_level(
             I_level, J_level, fixed_meta_level, moving_meta_level,
-            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, M_phys, t_phys,
+            None, None, None, None, M_phys, t_phys,
+            warp_state=warp_state,
+            metric_chunks=metric_chunks,
+            metric_devices=metric_devices,
+            inverse_history_device=inverse_history_device,
+            convergence_threshold=convergence_threshold,
+            convergence_window=convergence_window,
+            step_scaling=step_scaling,
             iterations=iteration_count,
             metric_terms=metric_terms_level,
             metric_masks=metric_masks_level,
@@ -1619,26 +1882,37 @@ def syn_registration(
     loss_history = [value for level in level_loss_history for value in level]
 
     # --- Final algebraic forward/inverse construction (half-warp swap) ------
+    # Ordered so that each full-resolution field is released as soon as it has been consumed
+    # (written to disk / folded into the next field); the arithmetic is unchanged.
+    # The normalized pyramid images are no longer needed.
+    I_full = J_full = I_level = J_level = None
+    metric_terms_full = metric_terms_level = metric_masks_full = metric_masks_level = None
     fixed_meta_t_full = metadata_tensors_from_dict(fixed_meta_full, resolved_device, dtype)
     moving_meta_t_full = metadata_tensors_from_dict(moving_meta_full, resolved_device, dtype)
     X_phys_full = _physical_grid(fixed_meta_full, resolved_device, dtype)
 
     syn_forward = _compose_fixed_grid(warp_l2r_inv, warp_r2l, X_phys_full, fixed_meta_t_full)
+    warp_l2r_inv = warp_r2l = None
     syn_inverse = _compose_fixed_grid(warp_r2l_inv, warp_l2r, X_phys_full, fixed_meta_t_full)
+    warp_r2l_inv = warp_l2r = None
+
+    # --- Write the affine and pure-SyN pieces separately (Etape 3) ----------
+    # syn_forward/syn_inverse (built above via the half-warp swap) are the
+    # *pure* dense deformation, computed before the fixed affine was folded
+    # in to build total_forward/total_inverse -- exactly the piece
+    # ants.registration() itself would write as "1Warp.nii.gz"/
+    # "1InverseWarp.nii.gz", with no recomputation or decomposition needed.
+    warp_path = f"{resolved_outprefix}1Warp.nii.gz"
+    inverse_warp_path = f"{resolved_outprefix}1InverseWarp.nii.gz"
+    _write_image(displacement_zyx_to_ants_image(syn_forward, fixed), warp_path)
+    _write_image(displacement_zyx_to_ants_image(syn_inverse, fixed), inverse_warp_path)
 
     # Total forward: apply the pure-SyN deformation, then the (fixed)
     # affine, matching prepare_mid_images_and_gradients_torch's own
     # `y_phys = phi_r2l_phys @ M_phys.t() + t_phys` convention.
-    phi = X_phys_full + syn_forward
-    moved_phys = torch.matmul(phi, M_phys.transpose(-1, -2)) + t_phys
-    total_forward = moved_phys - X_phys_full
-
-    inverse_matrix = torch.linalg.inv(M_phys)
-    inverse_translation = -torch.matmul(inverse_matrix, t_phys)
-    affine_inverse_displacement = (
-        torch.matmul(X_phys_full, inverse_matrix.transpose(-1, -2)) + inverse_translation - X_phys_full
-    )
-    total_inverse = _compose_fixed_grid(affine_inverse_displacement, syn_inverse, X_phys_full, fixed_meta_t_full)
+    total_forward = torch.matmul(X_phys_full + syn_forward, M_phys.transpose(-1, -2))
+    syn_forward = None
+    total_forward.add_(t_phys).sub_(X_phys_full)
 
     warpedmovout = grid_sample(
         ants_image_to_tensor(moving, resolved_device, dtype, normalize=False),
@@ -1649,15 +1923,8 @@ def syn_registration(
         ),
         mode="bilinear", padding_mode=padding_mode, align_corners=True,
     )
-    warpedfixout = grid_sample(
-        ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False),
-        physical_to_normalized_torch_cached(
-            X_phys_full + total_inverse,
-            fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
-            fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
-        ),
-        mode="bilinear", padding_mode=padding_mode, align_corners=True,
-    )
+    warpedmovout_image = tensor_to_ants_image(warpedmovout, fixed)
+    warpedmovout = None
 
     # total_forward is already a genuine physical-mm displacement field
     # (not a normalized-grid one), so the lower-level, spacing-aware
@@ -1667,17 +1934,28 @@ def syn_registration(
     jacobian = compute_jacobian_determinant_nd(
         total_forward, physical_spacing=fixed_meta_t_full["spacing_t"]
     ).unsqueeze(0)
+    jacobian_image = tensor_to_ants_image(jacobian, fixed)
+    jacobian = total_forward = None
 
-    # --- Write the affine and pure-SyN pieces separately (Etape 3) ----------
-    # syn_forward/syn_inverse (built above via the half-warp swap) are the
-    # *pure* dense deformation, computed before the fixed affine was folded
-    # in to build total_forward/total_inverse -- exactly the piece
-    # ants.registration() itself would write as "1Warp.nii.gz"/
-    # "1InverseWarp.nii.gz", with no recomputation or decomposition needed.
-    warp_path = f"{resolved_outprefix}1Warp.nii.gz"
-    inverse_warp_path = f"{resolved_outprefix}1InverseWarp.nii.gz"
-    ants.image_write(displacement_zyx_to_ants_image(syn_forward, fixed), warp_path)
-    ants.image_write(displacement_zyx_to_ants_image(syn_inverse, fixed), inverse_warp_path)
+    # 3x3 inverse on the CPU: creating a cuSOLVER handle can fail when the GPU is nearly full
+    inverse_matrix = torch.linalg.inv(M_phys.detach().double().cpu()).to(device=M_phys.device, dtype=M_phys.dtype)
+    inverse_translation = -torch.matmul(inverse_matrix, t_phys)
+    affine_inverse_displacement = torch.matmul(X_phys_full, inverse_matrix.transpose(-1, -2))
+    affine_inverse_displacement.add_(inverse_translation).sub_(X_phys_full)
+    total_inverse = _compose_fixed_grid(affine_inverse_displacement, syn_inverse, X_phys_full, fixed_meta_t_full)
+    affine_inverse_displacement = syn_inverse = None
+
+    warpedfixout = grid_sample(
+        ants_image_to_tensor(fixed, resolved_device, dtype, normalize=False),
+        physical_to_normalized_torch_cached(
+            X_phys_full + total_inverse,
+            fixed_meta_t_full["shape_t"], fixed_meta_t_full["spacing_t"],
+            fixed_meta_t_full["origin_t"], fixed_meta_t_full["direction_t"],
+        ),
+        mode="bilinear", padding_mode=padding_mode, align_corners=True,
+    )
+    warpedfixout_image = tensor_to_ants_image(warpedfixout, fixed)
+    warpedfixout = total_inverse = X_phys_full = None
 
     has_affine = initial_affine is not None or affine_result is not None
     affine_path = None
@@ -1690,11 +1968,11 @@ def syn_registration(
     )
 
     result = {
-        "warpedmovout": tensor_to_ants_image(warpedmovout, fixed),
-        "warpedfixout": tensor_to_ants_image(warpedfixout, fixed),
+        "warpedmovout": warpedmovout_image,
+        "warpedfixout": warpedfixout_image,
         "fwdtransforms": fwdtransforms,
         "invtransforms": invtransforms,
-        "jacobian": tensor_to_ants_image(jacobian, fixed),
+        "jacobian": jacobian_image,
         "loss_history": loss_history,
         "level_loss_history": level_loss_history,
         "affine_matrix": matrix_xyz.detach().cpu(),

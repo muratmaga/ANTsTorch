@@ -7,6 +7,8 @@ metadata (spacing, origin, direction) is supplied in ITK ``(x, y[, z])``
 order, and tensor spatial axes are the PyTorch-reversed ``(z, y, x)``.
 """
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -151,6 +153,32 @@ def _image_spatial_gradient(image):
     return None
 
 
+def _sampled_row_block(grid, depth):
+    """Rows [a, b) of a 3-D source that an align_corners=True bilinear grid can touch, and the grid
+    re-expressed relative to that block -- or None when the block would be (nearly) the whole depth."""
+    with torch.no_grad():
+        gz = grid[..., 2]
+        lo_n, hi_n = float(gz.min()), float(gz.max())
+    if not (math.isfinite(lo_n) and math.isfinite(hi_n)):
+        return None
+    lo = (lo_n + 1.0) * 0.5 * (depth - 1)
+    hi = (hi_n + 1.0) * 0.5 * (depth - 1)
+    a = min(max(0, int(math.floor(lo))), depth - 1)
+    b = max(min(depth, int(math.floor(hi)) + 2), a + 1)
+    if b - a < 2:                        # align_corners needs at least two rows to map onto
+        if b < depth:
+            b += 1
+        else:
+            a -= 1
+    if b - a > 0.75 * depth:
+        return None
+    with torch.no_grad():
+        z = (grid[..., 2].double() + 1.0) * (0.5 * (depth - 1)) - a
+        z_block = (z * (2.0 / (b - a - 1)) - 1.0).to(grid.dtype)
+        grid_block = torch.cat([grid[..., :2], z_block.unsqueeze(-1)], dim=-1)
+    return a, b, grid_block
+
+
 class AnalyticalGridSample(torch.autograd.Function):
     """``grid_sample`` with a hand-derived backward pass w.r.t. the sampling grid.
 
@@ -182,12 +210,34 @@ class AnalyticalGridSample(torch.autograd.Function):
         spatial_shape = input.shape[2:]
         B, C = input.shape[:2]
 
-        # 1. Spatial gradients of the source image: dI/dx, dI/dy, dI/dz.
-        grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
-
-        # 2. Sample source gradients at the grid lookup coordinates.
-        grad_I_flat = grad_I.view(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
-        grad_I_sampled = grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        # 1. Spatial gradients of the source image: dI/dx, dI/dy, dI/dz, and
+        # 2. their samples at the grid lookup coordinates.
+        sub = None
+        if dim == 3 and align_corners and mode == "bilinear" and padding_mode in ("border", "zeros"):
+            sub = _sampled_row_block(grid, spatial_shape[0])
+        if sub is None:
+            grad_I = _image_spatial_gradient(input)  # (B, C, dim, *spatial_shape)
+            grad_I_flat = grad_I.view(B, C * dim, *spatial_shape).to(dtype=grid.dtype)
+            del grad_I
+            grad_I_sampled = grid_sample(grad_I_flat, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners)
+        else:
+            # The grid only reaches rows [a, b) of the source (e.g. one slab of a chunked metric):
+            # compute the gradient on those rows alone. One extra row on each side, taken modulo the
+            # depth, reproduces _image_spatial_gradient's periodic (torch.roll) differences exactly;
+            # the grid's z coordinate is re-expressed relative to the block. The block always
+            # contains the image's first/last row when the grid reaches past it, so 'border' and
+            # 'zeros' padding behave as on the full image.
+            a, b, grid_block = sub
+            depth = spatial_shape[0]
+            rows = torch.arange(a - 1, b + 1, device=input.device) % depth
+            block = input.index_select(2, rows)
+            grad_I = _image_spatial_gradient(block)[:, :, :, 1:-1]   # (B, C, dim, b - a, H, W)
+            del block
+            grad_I_flat = grad_I.reshape(B, C * dim, b - a, *spatial_shape[1:]).to(dtype=grid.dtype)
+            del grad_I
+            grad_I_sampled = grid_sample(grad_I_flat, grid_block, mode=mode, padding_mode=padding_mode, align_corners=True)
+            del grid_block
+        del grad_I_flat
         grad_I_sampled = grad_I_sampled.view(B, C, dim, *grid.shape[1:-1])  # (B, C, dim, *spatial_grid)
 
         # 3. Inner product with the incoming loss gradient.
@@ -388,8 +438,10 @@ def physical_to_normalized_torch_cached(phys_coords, shape_t, spacing_t, origin_
     scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
     M = direction_t * scale_t.unsqueeze(0)
     b = -(origin_t @ M) - 1.0
-    flat_norm = flat_phys @ M + b
+    flat_norm = flat_phys @ M
+    flat_norm.add_(b)  # in place: one fewer field-sized temporary (matmul backward does not need its output)
     norm_coords = torch.flip(flat_norm, dims=[-1])
+    del flat_norm
     return norm_coords.view(phys_coords.shape)
 
 
@@ -402,7 +454,8 @@ def prepare_mid_images_and_gradients_torch(
     M_phys, t_phys, initial_grid_level,
     interpolator='linear',
     grad_I_curr=None, grad_J_curr=None,
-    use_analytical_gradients=True
+    use_analytical_gradients=True,
+    compute_gradients=True,
 ):
     """Sample both images (and their gradients) at the symmetric SyN midpoint.
 
@@ -439,17 +492,22 @@ def prepare_mid_images_and_gradients_torch(
 
     J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
 
-    if grad_I_curr is None:
-        grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
-    if grad_J_curr is None:
-        grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
+    grad_I_mid_sampled = grad_J_mid_sampled = None
+    if compute_gradients:
+        # Full-resolution image gradients (a 3-vector field on each image's grid) plus their
+        # midpoint samples: several field-sized tensors. Callers that only need the midpoint
+        # images and mask (the autograd SyN objective) pass compute_gradients=False.
+        if grad_I_curr is None:
+            grad_I_curr = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(fixed_spacing))).squeeze(-2)
+        if grad_J_curr is None:
+            grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing))).squeeze(-2)
 
-    grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
+        grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
+        grad_I_mid_sampled = torch.matmul(grad_I_mid_sampled, fixed_direction_t.t())
 
-    grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
-    grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
+        grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1).contiguous()
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, moving_direction_t.t())
+        grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys)
 
     dim = coords_norm.shape[-1]
     mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
